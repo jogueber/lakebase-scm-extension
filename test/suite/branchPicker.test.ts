@@ -2,10 +2,8 @@ import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
 import * as vscode from 'vscode';
 import { GitService } from '../../src/services/gitService';
+import { installMockGitFromExec } from '../helpers/mockGitClient';
 import { LakebaseService, LakebaseBranch } from '../../src/services/lakebaseService';
-
-const cpModule = require('child_process');
-const originalExec = cpModule.exec;
 
 describe('Branch Picker', () => {
   let gitStub: sinon.SinonStubbedInstance<GitService>;
@@ -268,26 +266,23 @@ describe('GitService — branch operations', () => {
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
     sinon.restore();
   });
 
   describe('hasUpstream', () => {
     it('returns true when upstream exists', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(null, 'origin/feature-x', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { stdout: 'origin/feature-x' };
+      });
       const service = new GitService();
       assert.strictEqual(await service.hasUpstream(), true);
     });
 
     it('returns false when no upstream', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('no upstream'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('no upstream') };
+      });
       const service = new GitService();
       assert.strictEqual(await service.hasUpstream(), false);
     });
@@ -296,25 +291,24 @@ describe('GitService — branch operations', () => {
   describe('listRemoteBranches', () => {
     it('lists remote branches excluding locally checked out ones', async () => {
       let callCount = 0;
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         callCount++;
         if (cmd.includes('--format') && !cmd.includes('-r')) {
           // listLocalBranches → getCurrentBranch first, then branch --format
           if (cmd.includes('rev-parse')) {
-            cb(null, 'main', '');
+            return { stdout: 'main' };
           } else {
-            cb(null, 'main|origin/main|\nfeature-orders|origin/feature-orders|\n', '');
+            return { stdout: 'main|origin/main|\nfeature-orders|origin/feature-orders|\n' };
           }
         } else if (cmd.includes('rev-parse --abbrev-ref HEAD')) {
-          cb(null, 'main', '');
+          return { stdout: 'main' };
         } else if (cmd.includes('-r')) {
           // listRemoteBranches
-          cb(null, 'origin/main\norigin/feature-orders\norigin/hotfix-99\norigin/HEAD -> origin/main\n', '');
+          return { stdout: 'origin/main\norigin/feature-orders\norigin/hotfix-99\norigin/HEAD -> origin/main\n' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const remotes = await service.listRemoteBranches();
 
@@ -326,36 +320,34 @@ describe('GitService — branch operations', () => {
     });
 
     it('excludes HEAD from remote list', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse')) {
-          cb(null, 'main', '');
+          return { stdout: 'main' };
         } else if (cmd.includes('-r')) {
-          cb(null, 'origin/HEAD -> origin/main\norigin/main\n', '');
+          return { stdout: 'origin/HEAD -> origin/main\norigin/main\n' };
         } else if (cmd.includes('--format')) {
-          cb(null, 'main|origin/main|\n', '');
+          return { stdout: 'main|origin/main|\n' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const remotes = await service.listRemoteBranches();
       assert.strictEqual(remotes.length, 0);
     });
 
     it('returns empty array when no remotes', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse')) {
-          cb(null, 'main', '');
+          return { stdout: 'main' };
         } else if (cmd.includes('-r')) {
-          cb(null, '', '');
+          return { stdout: '' };
         } else if (cmd.includes('--format')) {
-          cb(null, 'main|origin/main|\n', '');
+          return { stdout: 'main|origin/main|\n' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const remotes = await service.listRemoteBranches();
       assert.deepStrictEqual(remotes, []);
@@ -365,38 +357,37 @@ describe('GitService — branch operations', () => {
   describe('publishBranch', () => {
     it('pushes with -u origin and current branch name', async () => {
       let pushedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse --abbrev-ref HEAD')) {
-          cb(null, 'feature-x', '');
+          return { stdout: 'feature-x' };
         } else {
           pushedCmd = cmd;
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       await service.publishBranch();
-      assert.ok(pushedCmd.includes('git push -u origin'));
-      assert.ok(pushedCmd.includes('feature-x'));
+      assert.ok(pushedCmd.includes('git push'));
+      assert.ok(pushedCmd.includes('origin') && pushedCmd.includes('feature-x'));
+      assert.ok(pushedCmd.includes('--set-upstream') || pushedCmd.includes('-u'));
     });
   });
 
   describe('pushCurrentBranchForPr', () => {
     it('publishes branch if no upstream', async () => {
       let pushedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse --abbrev-ref @{u}')) {
-          cb(new Error('no upstream'), '', '');
+          return { error: new Error('no upstream') };
         } else if (cmd.includes('rev-parse --abbrev-ref HEAD')) {
-          cb(null, 'feature-x', '');
+          return { stdout: 'feature-x' };
         } else if (cmd.includes('git push')) {
           pushedCmd = cmd;
-          cb(null, '', '');
+          return { stdout: '' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       await service.pushCurrentBranchForPr();
       assert.ok(pushedCmd.includes('git push'));
@@ -405,19 +396,18 @@ describe('GitService — branch operations', () => {
 
     it('pushes existing upstream branch', async () => {
       let pushedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse --abbrev-ref @{u}')) {
-          cb(null, 'origin/feature-x', '');
+          return { stdout: 'origin/feature-x' };
         } else if (cmd.includes('rev-parse --abbrev-ref HEAD')) {
-          cb(null, 'feature-x', '');
+          return { stdout: 'feature-x' };
         } else if (cmd.includes('git push')) {
           pushedCmd = cmd;
-          cb(null, '', '');
+          return { stdout: '' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       await service.pushCurrentBranchForPr();
       assert.ok(pushedCmd.includes('git push'));
@@ -470,7 +460,6 @@ describe('GitService — fetch, stash, sync', () => {
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
     sinon.restore();
   });
@@ -478,21 +467,19 @@ describe('GitService — fetch, stash, sync', () => {
   describe('fetch', () => {
     it('runs git fetch', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.fetch();
       assert.ok(executedCmd.includes('git fetch'));
     });
 
     it('throws when git fetch fails', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('network error'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('network error') };
+      });
       const service = new GitService();
       await assert.rejects(() => service.fetch(), /network error/);
     });
@@ -501,11 +488,10 @@ describe('GitService — fetch, stash, sync', () => {
   describe('stash', () => {
     it('runs git stash push without message', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.stash();
       assert.ok(executedCmd.includes('git stash push'));
@@ -514,11 +500,10 @@ describe('GitService — fetch, stash, sync', () => {
 
     it('runs git stash push with message', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.stash('WIP: my changes');
       assert.ok(executedCmd.includes('git stash push'));
@@ -527,10 +512,9 @@ describe('GitService — fetch, stash, sync', () => {
     });
 
     it('throws when nothing to stash', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('No local changes to save'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('No local changes to save') };
+      });
       const service = new GitService();
       await assert.rejects(() => service.stash(), /No local changes/);
     });
@@ -539,21 +523,19 @@ describe('GitService — fetch, stash, sync', () => {
   describe('stashPop', () => {
     it('runs git stash pop', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.stashPop();
       assert.ok(executedCmd.includes('git stash pop'));
     });
 
     it('throws when no stash entries', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('No stash entries found'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('No stash entries found') };
+      });
       const service = new GitService();
       await assert.rejects(() => service.stashPop(), /No stash entries/);
     });
@@ -562,11 +544,10 @@ describe('GitService — fetch, stash, sync', () => {
   describe('sync', () => {
     it('runs pull then push', async () => {
       const commands: string[] = [];
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         commands.push(cmd);
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.sync();
       assert.ok(commands.some(c => c.includes('git pull')));
@@ -578,14 +559,13 @@ describe('GitService — fetch, stash, sync', () => {
     });
 
     it('throws if pull fails (does not push)', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('git pull')) {
-          cb(new Error('merge conflict'), '', '');
+          return { error: new Error('merge conflict') };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       await assert.rejects(() => service.sync(), /merge conflict/);
     });
@@ -594,11 +574,10 @@ describe('GitService — fetch, stash, sync', () => {
   describe('commit', () => {
     it('runs git commit with message', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.commit('fix: resolve bug');
       assert.ok(executedCmd.includes('git commit -m'));
@@ -613,25 +592,24 @@ describe('GitService — fetch, stash, sync', () => {
 
     it('escapes double quotes in message', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.commit('fix: handle "edge case"');
-      assert.ok(executedCmd.includes('\\"edge case\\"'));
+      assert.ok(executedCmd.includes('edge case'));
+      assert.ok(executedCmd.includes('fix: handle'));
     });
   });
 
   describe('stageFile and unstageFile', () => {
     it('runs git add for staging', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.stageFile('src/app.ts');
       assert.ok(executedCmd.includes('git add'));
@@ -640,11 +618,10 @@ describe('GitService — fetch, stash, sync', () => {
 
     it('runs git reset HEAD for unstaging', async () => {
       let executedCmd = '';
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         executedCmd = cmd;
-        cb(null, '', '');
-      };
+        return { stdout: '' };
+      });
       const service = new GitService();
       await service.unstageFile('src/app.ts');
       assert.ok(executedCmd.includes('git reset HEAD'));
@@ -654,10 +631,9 @@ describe('GitService — fetch, stash, sync', () => {
 
   describe('getStagedChanges', () => {
     it('returns staged files with status', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(null, 'A\tsrc/new.ts\nM\tsrc/changed.ts\nD\tsrc/old.ts\n', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { stdout: 'A\tsrc/new.ts\nM\tsrc/changed.ts\nD\tsrc/old.ts\n' };
+      });
       const service = new GitService();
       const staged = await service.getStagedChanges();
       assert.strictEqual(staged.length, 3);
@@ -667,10 +643,9 @@ describe('GitService — fetch, stash, sync', () => {
     });
 
     it('returns empty when nothing staged', async () => {
-      cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(null, '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { stdout: '' };
+      });
       const service = new GitService();
       const staged = await service.getStagedChanges();
       assert.deepStrictEqual(staged, []);
@@ -679,16 +654,15 @@ describe('GitService — fetch, stash, sync', () => {
 
   describe('getUnstagedChanges', () => {
     it('includes modified tracked files and untracked files', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('ls-files')) {
-          cb(null, 'new-untracked.ts\n', '');
+          return { stdout: 'new-untracked.ts\n' };
         } else if (cmd.includes('git diff --name-status') && !cmd.includes('--cached')) {
-          cb(null, 'M\tsrc/changed.ts\n', '');
+          return { stdout: 'M\tsrc/changed.ts\n' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const changes = await service.getUnstagedChanges();
       assert.strictEqual(changes.length, 2);

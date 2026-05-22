@@ -1,6 +1,17 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
+import type { SimpleGit } from 'simple-git';
 import { getConfig, getWorkspaceRoot } from '../utils/config';
-import { exec } from '../utils/exec';
+import {
+  existsRef,
+  getGit,
+  gitRaw,
+  nameOnlyDiff,
+  nameStatusDiff,
+  parseNameStatus,
+  revparse,
+} from '../utils/gitClient';
 import { formatOwnerRepo, parseOwnerRepo } from '../utils/parseRepo';
 
 export interface PullRequestCheck {
@@ -65,11 +76,11 @@ export class GitService {
   private currentBranch: string = '';
   private watcher: vscode.FileSystemWatcher | undefined;
   private pollInterval: NodeJS.Timeout | undefined;
+  private cachedRepoRoot = '';
 
   async initialize(): Promise<void> {
     this.currentBranch = await this.getCurrentBranch();
 
-    // Watch .git/HEAD for branch changes
     const root = getWorkspaceRoot();
     if (root) {
       const headPattern = new vscode.RelativePattern(root, '.git/HEAD');
@@ -78,7 +89,6 @@ export class GitService {
       this.watcher.onDidCreate(() => this.checkBranchChange());
     }
 
-    // Poll as a fallback (some git operations don't trigger file watchers)
     this.pollInterval = setInterval(() => this.checkBranchChange(), 5000);
   }
 
@@ -86,7 +96,6 @@ export class GitService {
     try {
       const branch = await this.getCurrentBranch();
       if (branch !== this.currentBranch && branch) {
-        const previous = this.currentBranch;
         this.currentBranch = branch;
         this._onBranchChanged.fire(branch);
       }
@@ -95,13 +104,34 @@ export class GitService {
     }
   }
 
-  async getCurrentBranch(): Promise<string> {
-    const root = getWorkspaceRoot();
-    if (!root) {
+  private workspaceRoot(): string {
+    return getWorkspaceRoot() || '';
+  }
+
+  /** simple-git client; optional `cwd` for repos outside the active workspace folder. */
+  private gitClient(cwd?: string): SimpleGit {
+    const base = cwd || this.workspaceRoot();
+    if (!base) {
+      throw new Error('No workspace root');
+    }
+    return getGit(base);
+  }
+
+  private async repoBase(cwd?: string): Promise<string> {
+    if (cwd) {
+      return cwd;
+    }
+    const cached = await this.getRepoRoot();
+    return cached || this.workspaceRoot();
+  }
+
+  async getCurrentBranch(cwd?: string): Promise<string> {
+    const base = cwd || this.workspaceRoot();
+    if (!base) {
       return '';
     }
     try {
-      return await exec('git rev-parse --abbrev-ref HEAD', root);
+      return (await revparse(this.gitClient(base), '--abbrev-ref', 'HEAD')).trim();
     } catch {
       return '';
     }
@@ -120,28 +150,35 @@ export class GitService {
     if (this.cachedRepoRoot) {
       return this.cachedRepoRoot;
     }
-    const root = getWorkspaceRoot();
+    const root = this.workspaceRoot();
     if (!root) {
       return '';
     }
     try {
-      const out = await exec('git rev-parse --show-toplevel', root);
-      this.cachedRepoRoot = out.trim();
+      this.cachedRepoRoot = await revparse(this.gitClient(root), '--show-toplevel');
       return this.cachedRepoRoot;
     } catch {
       return root;
     }
   }
-  private cachedRepoRoot = '';
 
   async listLocalBranches(): Promise<GitBranchInfo[]> {
-    const root = getWorkspaceRoot();
+    const root = this.workspaceRoot();
     if (!root) {
       return [];
     }
 
     const current = await this.getCurrentBranch();
-    const raw = await exec('git branch --format="%(refname:short)|%(upstream:short)|%(upstream:track)"', root);
+    const git = this.gitClient(root);
+    let raw: string;
+    try {
+      raw = await gitRaw(git, [
+        'branch',
+        '--format=%(refname:short)|%(upstream:short)|%(upstream:track)',
+      ]);
+    } catch {
+      return [];
+    }
 
     if (!raw) {
       return [];
@@ -155,8 +192,8 @@ export class GitService {
       if (trackInfo) {
         const aheadMatch = trackInfo.match(/ahead (\d+)/);
         const behindMatch = trackInfo.match(/behind (\d+)/);
-        if (aheadMatch) {ahead = parseInt(aheadMatch[1], 10);}
-        if (behindMatch) {behind = parseInt(behindMatch[1], 10);}
+        if (aheadMatch) { ahead = parseInt(aheadMatch[1], 10); }
+        if (behindMatch) { behind = parseInt(behindMatch[1], 10); }
       }
 
       return {
@@ -170,22 +207,20 @@ export class GitService {
     });
   }
 
-  /** List remote branches (excluding those already checked out locally) */
   async listRemoteBranches(): Promise<GitBranchInfo[]> {
-    const root = getWorkspaceRoot();
+    const root = this.workspaceRoot();
     if (!root) { return []; }
 
     try {
       const localBranches = await this.listLocalBranches();
       const localNames = new Set(localBranches.map(b => b.name));
 
-      const raw = await exec('git branch -r --format="%(refname:short)"', root);
+      const raw = await gitRaw(this.gitClient(root), ['branch', '-r', '--format=%(refname:short)']);
       if (!raw) { return []; }
 
       return raw.split('\n').filter(Boolean)
         .filter(name => !name.includes('HEAD'))
         .map(name => {
-          // Remote branch names are like "origin/feature-x"
           const shortName = name.replace(/^origin\//, '');
           return { name, shortName };
         })
@@ -201,86 +236,92 @@ export class GitService {
     }
   }
 
-  /** Get file contents at a given git ref (e.g. 'main', a commit sha) */
   async getFileAtRef(ref: string, filePath: string): Promise<string> {
-    const root = getWorkspaceRoot();
-    if (!root) { return ''; }
+    const base = await this.repoBase();
+    if (!base) { return ''; }
     try {
-      return await exec(`git show "${ref}:${filePath}"`, root);
-    } catch {
-      return ''; // File doesn't exist at that ref (new file)
-    }
-  }
-
-  /** Get the merge-base commit between HEAD and main/master */
-  async getMergeBase(): Promise<string> {
-    const root = getWorkspaceRoot();
-    if (!root) { return ''; }
-    let baseBranch = 'main';
-    try {
-      await exec('git rev-parse --verify main', root);
-    } catch {
-      try {
-        await exec('git rev-parse --verify master', root);
-        baseBranch = 'master';
-      } catch {
-        return '';
-      }
-    }
-    try {
-      return await exec(`git merge-base ${baseBranch} HEAD`, root);
+      return await this.gitClient(base).show(`${ref}:${filePath}`);
     } catch {
       return '';
     }
   }
 
-  async checkoutBranch(branchName: string, create: boolean = false, startPoint?: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) {
-      throw new Error('No workspace root');
+  async getMergeBase(): Promise<string> {
+    const base = await this.repoBase();
+    if (!base) { return ''; }
+    const git = this.gitClient(base);
+    let baseBranch = 'main';
+    if (!(await existsRef(git, 'main'))) {
+      if (await existsRef(git, 'master')) {
+        baseBranch = 'master';
+      } else {
+        return '';
+      }
     }
-    const flag = create ? '-b ' : '';
-    const sp = startPoint ? ` "${startPoint}"` : '';
-    await exec(`git checkout ${flag}"${branchName}"${sp}`, root);
+    try {
+      return await gitRaw(git, ['merge-base', baseBranch, 'HEAD']);
+    } catch {
+      return '';
+    }
   }
 
-  /** Get files changed between current branch and main/master */
-  /**
-   * List files changed between a branch (default: HEAD / current working tree)
-   * and a base branch (default: trunk — `config.trunkBranch` if set, else
-   * `main`/`master`).
-   *
-   * @param branch    Branch to compute changes FOR. Default `HEAD` — include
-   *                  uncommitted + untracked files in the working tree. Pass
-   *                  an explicit branch name to compute that branch's diff
-   *                  against the base, ignoring the working tree.
-   * @param baseOverride  Branch to diff AGAINST. Defaults to `config.trunkBranch`
-   *                  when set, otherwise `main`/`master`.
-   */
+  /** Merge-base SHA between two refs (e.g. HEAD and a branch name). */
+  async mergeBase(ref1: string, ref2: string, cwd?: string): Promise<string> {
+    const base = cwd || await this.repoBase();
+    if (!base) { return ''; }
+    try {
+      return await gitRaw(this.gitClient(base), ['merge-base', ref1, ref2]);
+    } catch {
+      return '';
+    }
+  }
+
+  /** Unix timestamp of a commit. */
+  async commitTimestamp(sha: string, cwd?: string): Promise<number> {
+    const base = cwd || await this.repoBase();
+    if (!base) { return 0; }
+    try {
+      const out = await gitRaw(this.gitClient(base), ['log', '-1', '--format=%at', sha]);
+      return parseInt(out, 10) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Count commits in a rev-list range (e.g. `main..HEAD`). */
+  async revListCount(range: string, cwd?: string): Promise<number> {
+    const base = cwd || await this.repoBase();
+    if (!base) { return 0; }
+    try {
+      const out = await gitRaw(this.gitClient(base), ['rev-list', '--count', range]);
+      return parseInt(out, 10) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  async checkoutBranch(branchName: string, create: boolean = false, startPoint?: string): Promise<void> {
+    const git = this.gitClient(await this.repoBase());
+    await git.checkout(
+      create ? ['-b', branchName, ...(startPoint ? [startPoint] : [])] : branchName,
+    );
+  }
+
   async getChangedFiles(branch?: string, baseOverride?: string): Promise<GitFileChange[]> {
-    const root = getWorkspaceRoot();
+    const root = this.workspaceRoot();
     if (!root) {
       return [];
     }
+    const git = this.gitClient(root);
 
-    // Resolve base branch:
-    //   1. explicit override arg
-    //   2. LAKEBASE_BASE_BRANCH (config.baseBranch) — explicit project pin
-    //      ("features fork from staging — diff against staging").
-    //   3. NEAREST PARENT via merge-base. Across known parent candidates
-    //      (config.trunkBranch || main, master, config.stagingBranch ||
-    //      staging), pick the one whose merge-base with the tip has the
-    //      most recent commit timestamp. In a 3-tier flow where a feature
-    //      forks from staging, staging's merge-base is later than main's,
-    //      so the diff naturally targets the actual parent.
-    //   4. config.trunkBranch
-    //   5. main / master
     const cfgGcf = getConfig();
     let baseBranch = baseOverride || cfgGcf.baseBranch || '';
     if (!baseBranch) {
       const tipForMb = branch && branch.length > 0 ? branch : 'HEAD';
       let currentBranchName = '';
-      try { currentBranchName = (await exec('git rev-parse --abbrev-ref HEAD', root)).trim(); } catch { /* ignore */ }
+      try {
+        currentBranchName = await revparse(git, '--abbrev-ref', 'HEAD');
+      } catch { /* ignore */ }
       const tipBranch = (branch && branch.length > 0) ? branch : currentBranchName;
       const candidates = Array.from(new Set(
         [cfgGcf.trunkBranch, 'main', 'master', cfgGcf.stagingBranch, 'staging'].filter(Boolean) as string[]
@@ -289,9 +330,9 @@ export class GitService {
       for (const c of candidates) {
         if (c === tipBranch) { continue; }
         try {
-          const baseSha = (await exec(`git merge-base "${tipForMb}" "${c}"`, root)).trim();
+          const baseSha = await gitRaw(git, ['merge-base', tipForMb, c]);
           if (!baseSha) { continue; }
-          const ts = parseInt((await exec(`git log -1 --format=%at "${baseSha}"`, root)).trim(), 10) || 0;
+          const ts = parseInt(await gitRaw(git, ['log', '-1', '--format=%at', baseSha]), 10) || 0;
           if (ts > bestTs) {
             bestTs = ts;
             baseBranch = c;
@@ -301,56 +342,26 @@ export class GitService {
     }
     if (!baseBranch) {
       baseBranch = cfgGcf.trunkBranch || 'main';
-      try {
-        await exec(`git rev-parse --verify ${baseBranch}`, root);
-      } catch {
-        try {
-          await exec('git rev-parse --verify master', root);
+      if (!(await existsRef(git, baseBranch))) {
+        if (await existsRef(git, 'master')) {
           baseBranch = 'master';
-        } catch {
+        } else {
           return [];
         }
       }
-    } else {
-      // Verify the chosen base actually exists.
-      try {
-        await exec(`git rev-parse --verify ${baseBranch}`, root);
-      } catch {
-        return [];
-      }
+    } else if (!(await existsRef(git, baseBranch))) {
+      return [];
     }
 
-    // Resolve the "tip" side. HEAD means include untracked + uncommitted files.
     const tip = branch && branch.length > 0 ? branch : 'HEAD';
     const includeUntracked = tip === 'HEAD';
 
     try {
-      // git diff <base>...<tip> == diff between merge-base(base,tip) and tip.
-      // Using the triple-dot form lets git resolve the merge-base internally,
-      // which works whether tip is HEAD or a named branch.
-      const raw = await exec(`git diff --name-status ${baseBranch}...${tip}`, root);
+      const changes: GitFileChange[] = await nameStatusDiff(git, `${baseBranch}...${tip}`);
 
-      const statusMap: Record<string, GitFileChange['status']> = {
-        'A': 'added', 'M': 'modified', 'D': 'deleted',
-      };
-
-      const changes: GitFileChange[] = raw
-        ? raw.split('\n').filter(Boolean).map(line => {
-            const parts = line.split('\t');
-            const code = parts[0][0];
-            if (code === 'R') {
-              return { status: 'renamed' as const, path: parts[2], oldPath: parts[1] };
-            }
-            return { status: statusMap[code] || 'modified', path: parts[1] };
-          })
-        : [];
-
-      // Also include untracked files (new files not yet staged) -- only when
-      // looking at the working tree (HEAD). For named-branch diffs, untracked
-      // files aren't part of that branch.
       if (includeUntracked) {
         try {
-          const untracked = await exec('git ls-files --others --exclude-standard', root);
+          const untracked = await gitRaw(git, ['ls-files', '--others', '--exclude-standard']);
           if (untracked) {
             const trackedPaths = new Set(changes.map(c => c.path));
             for (const filePath of untracked.split('\n').filter(Boolean)) {
@@ -370,17 +381,16 @@ export class GitService {
     }
   }
 
-  /** List migration filenames on a given branch (without checking it out) */
   async listMigrationsOnBranch(branchName: string, migrationPath: string, pattern?: RegExp): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) {
+    const base = await this.repoBase();
+    if (!base) {
       return [];
     }
     const filePattern = pattern || /^V\d+.*\.sql$/i;
     try {
-      const raw = await exec(
-        `git ls-tree --name-only "${branchName}" -- "${migrationPath}/"`,
-        root
+      const raw = await gitRaw(
+        this.gitClient(base),
+        ['ls-tree', '--name-only', branchName, '--', `${migrationPath}/`],
       );
       if (!raw) {
         return [];
@@ -394,73 +404,38 @@ export class GitService {
     }
   }
 
-  /** Get currently staged files */
   async getStagedFiles(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) {
+    const base = await this.repoBase();
+    if (!base) {
       return [];
     }
     try {
-      const raw = await exec('git diff --cached --name-only', root);
-      return raw ? raw.split('\n').filter(Boolean) : [];
+      return await nameOnlyDiff(this.gitClient(base), '--cached');
     } catch {
       return [];
     }
   }
 
-  /** Get staged files with their change status */
   async getStagedChanges(): Promise<GitFileChange[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git diff --cached --name-status', root);
-      if (!raw) { return []; }
-      const statusMap: Record<string, GitFileChange['status']> = {
-        'A': 'added', 'M': 'modified', 'D': 'deleted',
-      };
-      return raw.split('\n').filter(Boolean).map(line => {
-        const parts = line.split('\t');
-        const code = parts[0][0];
-        if (code === 'R') {
-          return { status: 'renamed' as const, path: parts[2], oldPath: parts[1] };
-        }
-        return { status: statusMap[code] || 'modified', path: parts[1] };
-      });
+      return await nameStatusDiff(this.gitClient(base), '--cached');
     } catch {
       return [];
     }
   }
 
-  /** Get unstaged changes (modified/deleted tracked files + untracked files) */
   async getUnstagedChanges(): Promise<GitFileChange[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const changes: GitFileChange[] = [];
-      const statusMap: Record<string, GitFileChange['status']> = {
-        'M': 'modified', 'D': 'deleted',
-      };
-
-      // Modified/deleted tracked files not yet staged
-      const raw = await exec('git diff --name-status', root);
-      if (raw) {
-        for (const line of raw.split('\n').filter(Boolean)) {
-          const parts = line.split('\t');
-          const code = parts[0][0];
-          changes.push({ status: statusMap[code] || 'modified', path: parts[1] });
-        }
+      const git = this.gitClient(base);
+      const changes: GitFileChange[] = await nameStatusDiff(git);
+      const status = await git.status();
+      for (const filePath of status.not_added) {
+        changes.push({ status: 'added', path: filePath });
       }
-
-      // Untracked files
-      try {
-        const untracked = await exec('git ls-files --others --exclude-standard', root);
-        if (untracked) {
-          for (const filePath of untracked.split('\n').filter(Boolean)) {
-            changes.push({ status: 'added', path: filePath });
-          }
-        }
-      } catch { /* ignore */ }
-
       return changes;
     } catch {
       return [];
@@ -468,65 +443,53 @@ export class GitService {
   }
 
   async stageFile(filePath: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git add "${filePath}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).add(filePath);
   }
 
   async unstageFile(filePath: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git reset HEAD "${filePath}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).reset(['HEAD', '--', filePath]);
   }
 
   async discardFile(filePath: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    // Check if file is untracked
+    const repoRoot = await this.repoBase();
+    const git = this.gitClient(repoRoot);
     try {
-      await exec(`git ls-files --error-unmatch "${filePath}"`, root);
-      // Tracked file — restore from HEAD
-      await exec(`git checkout -- "${filePath}"`, root);
+      await gitRaw(git, ['ls-files', '--error-unmatch', filePath]);
+      await git.checkout(['--', filePath]);
     } catch {
-      // Untracked file — delete it
-      const fs = require('fs');
-      const path = require('path');
-      const fullPath = path.join(root, filePath);
+      const fullPath = path.join(repoRoot, filePath);
       if (fs.existsSync(fullPath)) { fs.unlinkSync(fullPath); }
     }
   }
 
   async commit(message: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+    const base = await this.repoBase();
     if (!message.trim()) { throw new Error('Commit message is required'); }
-    await exec(`git commit -m "${message.replace(/"/g, '\\"')}"`, root);
+    await this.gitClient(base).commit(message);
   }
 
-  /** Check if current branch has a remote upstream */
-  async hasUpstream(): Promise<boolean> {
-    const root = getWorkspaceRoot();
-    if (!root) { return false; }
+  async hasUpstream(cwd?: string): Promise<boolean> {
+    const base = cwd || await this.repoBase();
+    if (!base) { return false; }
     try {
-      await exec('git rev-parse --abbrev-ref @{u}', root);
+      await revparse(this.gitClient(base), '--abbrev-ref', '@{u}');
       return true;
     } catch {
       return false;
     }
   }
 
-  /** Get ahead/behind counts relative to upstream */
   async getAheadBehind(): Promise<{ ahead: number; behind: number; upstream: string }> {
-    const root = getWorkspaceRoot();
-    if (!root) { return { ahead: 0, behind: 0, upstream: '' }; }
+    const base = await this.repoBase();
+    if (!base) { return { ahead: 0, behind: 0, upstream: '' }; }
     try {
-      const upstream = (await exec('git rev-parse --abbrev-ref @{u}', root)).trim();
-      const raw = await exec(`git rev-list --left-right --count HEAD...@{u}`, root);
-      const parts = raw.trim().split(/\s+/);
+      const status = await this.gitClient(base).status();
       return {
-        ahead: parseInt(parts[0], 10) || 0,
-        behind: parseInt(parts[1], 10) || 0,
-        upstream,
+        ahead: status.ahead,
+        behind: status.behind,
+        upstream: status.tracking || '',
       };
     } catch {
       return { ahead: 0, behind: 0, upstream: '' };
@@ -534,176 +497,162 @@ export class GitService {
   }
 
   async push(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git push', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).push();
   }
 
-  /** Push local branch to remote for the first time */
   async publishBranch(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+    const base = await this.repoBase();
     const branch = await this.getCurrentBranch();
     if (!branch) { throw new Error('No current branch'); }
-    await exec(`git push -u origin "${branch}"`, root);
+    await this.gitClient(base).push('origin', branch, ['--set-upstream']);
   }
 
   async pull(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git pull', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).pull();
   }
 
-  /**
-   * Ensure the current branch is pushed to origin before PR creation.
-   * Publishes with `-u origin` when no upstream exists; otherwise pushes
-   * latest commits. Pair with {@link GitHubService.createPullRequest} — git
-   * handles push, GitHubService handles the REST API (formerly `gh pr create`).
-   */
   async pushCurrentBranchForPr(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+    const base = await this.repoBase();
     const branch = await this.getCurrentBranch();
     if (!branch) { throw new Error('No current branch'); }
+    const git = this.gitClient(base);
     const hasRemote = await this.hasUpstream();
     if (!hasRemote) {
-      await exec(`git push -u origin "${branch}"`, root);
+      await git.push('origin', branch, ['--set-upstream']);
     } else {
-      await exec('git push', root);
+      await git.push();
     }
   }
 
-  async commitAll(message: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+  async commitAll(message: string, cwd?: string): Promise<void> {
+    const base = cwd || await this.repoBase();
     if (!message.trim()) { throw new Error('Commit message is required'); }
-    await exec('git add -A', root);
-    await exec(`git commit -m "${message.replace(/"/g, '\\"')}"`, root);
+    const git = this.gitClient(base);
+    await git.add('-A');
+    await git.commit(message);
   }
 
   async commitAmend(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git commit --amend --no-edit', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).commit('', { '--amend': null, '--no-edit': null });
   }
 
   async commitAmendMessage(message: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+    const base = await this.repoBase();
     if (!message.trim()) { throw new Error('Commit message is required'); }
-    await exec(`git commit --amend -m "${message.replace(/"/g, '\\"')}"`, root);
+    await this.gitClient(base).commit(message, { '--amend': null });
   }
 
   async undoLastCommit(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git reset --soft HEAD~1', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).reset(['--soft', 'HEAD~1']);
   }
 
   async discardAllChanges(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git checkout -- .', root);
-    await exec('git clean -fd', root);
+    const base = await this.repoBase();
+    const git = this.gitClient(base);
+    await git.checkout(['--', '.']);
+    await gitRaw(git, ['clean', '-fd']);
   }
 
   async deleteBranch(branchName: string, force = false): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    const flag = force ? '-D' : '-d';
-    await exec(`git branch ${flag} "${branchName}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).deleteLocalBranch(branchName, force);
   }
 
-  /** Check if a branch exists on origin. Returns false when no origin remote or branch is absent. */
   async hasRemoteBranch(branchName: string): Promise<boolean> {
-    const root = getWorkspaceRoot();
-    if (!root) { return false; }
+    const base = await this.repoBase();
+    if (!base) { return false; }
     try {
-      const out = await exec(`git ls-remote --heads origin "${branchName}"`, root);
-      return out.trim().length > 0;
+      const out = await gitRaw(this.gitClient(base), ['ls-remote', '--heads', 'origin', branchName]);
+      return out.length > 0;
     } catch {
       return false;
     }
   }
 
-  /** True when the working tree has staged or unstaged changes. */
   async isDirty(): Promise<boolean> {
-    const root = getWorkspaceRoot();
-    if (!root) { return false; }
+    const base = await this.repoBase();
+    if (!base) { return false; }
     try {
-      const out = await exec('git status --porcelain', root);
-      return out.trim().length > 0;
+      const status = await this.gitClient(base).status();
+      return !status.isClean();
     } catch {
       return false;
     }
   }
 
   async renameBranch(newName: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git branch -m "${newName}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).branch(['-m', newName]);
   }
 
   async mergeBranch(branchName: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git merge "${branchName}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).merge([branchName]);
   }
 
   async createTag(name: string, message?: string, sha?: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    const msg = message ? ` -m "${message.replace(/"/g, '\\"')}"` : '';
-    const target = sha ? ` "${sha}"` : '';
-    await exec(`git tag${msg ? ' -a' : ''} "${name}"${msg}${target}`, root);
+    const base = await this.repoBase();
+    const git = this.gitClient(base);
+    if (sha) {
+      await gitRaw(git, message
+        ? ['tag', '-a', name, '-m', message, sha]
+        : ['tag', name, sha]);
+      return;
+    }
+    if (message) {
+      await git.addAnnotatedTag(name, message);
+    } else {
+      await git.addTag(name);
+    }
   }
 
   async deleteTag(name: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git tag -d "${name}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).tag(['-d', name]);
   }
 
   async deleteRemoteTag(name: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git push origin --delete "refs/tags/${name}"`, root);
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['push', 'origin', '--delete', `refs/tags/${name}`]);
   }
 
   async commitSignedOff(message: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+    const base = await this.repoBase();
     if (!message.trim()) { throw new Error('Commit message is required'); }
-    await exec(`git commit -s -m "${message.replace(/"/g, '\\"')}"`, root);
+    await this.gitClient(base).commit(message, { '-s': null });
   }
 
-  async commitAllSignedOff(message: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
+  async commitAllSignedOff(message: string, cwd?: string): Promise<void> {
+    const base = cwd || await this.repoBase();
     if (!message.trim()) { throw new Error('Commit message is required'); }
-    await exec('git add -A', root);
-    await exec(`git commit -s -m "${message.replace(/"/g, '\\"')}"`, root);
+    const git = this.gitClient(base);
+    await git.add('-A');
+    await git.commit(message, { '-s': null });
   }
 
   async stashStaged(message?: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    const msg = message ? ` -m "${message.replace(/"/g, '\\"')}"` : '';
-    await exec(`git stash push --staged${msg}`, root);
+    const base = await this.repoBase();
+    const args = ['push', '--staged'];
+    if (message) { args.push('-m', message); }
+    await this.gitClient(base).stash(args);
   }
 
   async stashIncludeUntracked(message?: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    const msg = message ? ` -m "${message.replace(/"/g, '\\"')}"` : '';
-    await exec(`git stash push --include-untracked${msg}`, root);
+    const base = await this.repoBase();
+    const args = ['push', '--include-untracked'];
+    if (message) { args.push('-m', message); }
+    await this.gitClient(base).stash(args);
   }
 
   async stashList(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git stash list', root);
+      const raw = await gitRaw(this.gitClient(base), ['stash', 'list']);
       return raw ? raw.split('\n').filter(Boolean) : [];
     } catch {
       return [];
@@ -711,151 +660,146 @@ export class GitService {
   }
 
   async stashApply(index: number = 0): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git stash apply stash@{${index}}`, root);
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['stash', 'apply', `stash@{${index}}`]);
   }
 
   async stashDrop(index: number = 0): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git stash drop stash@{${index}}`, root);
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['stash', 'drop', `stash@{${index}}`]);
   }
 
   async stashDropAll(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git stash clear', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).stash(['clear']);
   }
 
   async listTags(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git tag -l', root);
-      return raw ? raw.split('\n').filter(Boolean) : [];
+      const result = await this.gitClient(base).tags();
+      return result.all;
     } catch {
       return [];
     }
   }
 
   async abortRebase(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git rebase --abort', root);
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['rebase', '--abort']);
   }
 
   async isRebasing(): Promise<boolean> {
-    const root = getWorkspaceRoot();
-    if (!root) { return false; }
-    const fs = require('fs');
-    const path = require('path');
-    return fs.existsSync(path.join(root, '.git/rebase-merge')) ||
-           fs.existsSync(path.join(root, '.git/rebase-apply'));
+    const repoRoot = await this.getRepoRoot();
+    if (!repoRoot) { return false; }
+    return fs.existsSync(path.join(repoRoot, '.git/rebase-merge')) ||
+           fs.existsSync(path.join(repoRoot, '.git/rebase-apply'));
   }
 
   async rebaseBranch(branchName: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git rebase "${branchName}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).rebase([branchName]);
   }
 
   async deleteRemoteBranch(branchName: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git push origin --delete "${branchName}"`, root);
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['push', 'origin', '--delete', branchName]);
   }
 
   async addRemote(name: string, url: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git remote add "${name}" "${url}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).addRemote(name, url);
   }
 
   async removeRemote(name: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git remote remove "${name}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).removeRemote(name);
   }
 
-  async createWorktree(path: string, branchName: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git worktree add "${path}" -b "${branchName}"`, root);
+  async createWorktree(worktreePath: string, branchName: string): Promise<void> {
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['worktree', 'add', worktreePath, '-b', branchName]);
   }
 
   async listWorktrees(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git worktree list', root);
+      const raw = await gitRaw(this.gitClient(base), ['worktree', 'list']);
       return raw ? raw.split('\n').filter(Boolean) : [];
     } catch {
       return [];
     }
   }
 
-  async removeWorktree(path: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git worktree remove "${path}"`, root);
+  async removeWorktree(worktreePath: string): Promise<void> {
+    const base = await this.repoBase();
+    await gitRaw(this.gitClient(base), ['worktree', 'remove', worktreePath]);
   }
 
   async fetch(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git fetch', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).fetch();
   }
 
   async fetchPrune(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git fetch --prune', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).fetch(['--prune']);
   }
 
   async fetchAll(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git fetch --all', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).fetch(['--all']);
   }
 
   async revert(sha: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    // Detect merge commits and automatically use -m 1 (revert relative to first parent)
-    const parents = (await exec(`git rev-parse "${sha}^@"`, root)).trim().split('\n').filter(Boolean);
-    const mFlag = parents.length > 1 ? ' -m 1' : '';
-    await exec(`git revert --no-edit${mFlag} "${sha}"`, root);
+    const base = await this.repoBase();
+    const git = this.gitClient(base);
+    const parents = (await revparse(git, `${sha}^@`)).split('\n').filter(Boolean);
+    const args = ['revert', '--no-edit'];
+    if (parents.length > 1) {
+      args.push('-m', '1');
+    }
+    args.push(sha);
+    await gitRaw(git, args);
   }
 
   async cherryPick(sha: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git cherry-pick "${sha}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).raw(['cherry-pick', sha]);
   }
 
   async checkoutDetached(sha: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git checkout --detach "${sha}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).checkout(['--detach', sha]);
   }
 
   async getBranchesAtCommit(sha: string): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec(`git branch -a --points-at "${sha}" --format="%(refname:short)"`, root);
-      return raw.trim().split('\n').filter(Boolean).filter(b => !b.includes('HEAD') && b !== 'origin');
-    } catch { return []; }
+      const raw = await gitRaw(
+        this.gitClient(base),
+        ['branch', '-a', '--points-at', sha, '--format=%(refname:short)'],
+      );
+      return raw.split('\n').filter(Boolean).filter(b => !b.includes('HEAD') && b !== 'origin');
+    } catch {
+      return [];
+    }
   }
 
   async getCommitFiles(sha: string): Promise<Array<{ status: string; path: string }>> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
-    let raw = await exec(`git diff-tree --no-commit-id --name-status -r "${sha}"`, root);
-    // Merge commits: diff-tree returns empty, diff against first parent
-    if (!raw.trim()) {
-      try { raw = await exec(`git diff --name-status "${sha}^1" "${sha}"`, root); } catch { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
+    const git = this.gitClient(base);
+    let raw = await gitRaw(git, ['diff-tree', '--no-commit-id', '--name-status', '-r', sha]);
+    if (!raw) {
+      try {
+        raw = String(await git.diff(['--name-status', `${sha}^1`, sha])).trim();
+      } catch {
+        return [];
+      }
     }
     return raw.split('\n').filter(Boolean).map(line => {
       const parts = line.split('\t');
@@ -863,47 +807,43 @@ export class GitService {
     });
   }
 
-  /**
-   * Get diff files between two refs, or between a ref and the working tree.
-   * @param fromRef - The base ref (e.g. a commit SHA)
-   * @param toRef - The target ref (e.g. "HEAD"), or null for working tree
-   */
   async getDiffFiles(fromRef: string, toRef: string | null): Promise<Array<{ status: string; path: string }>> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const cmd = toRef
-        ? `git diff --name-status "${fromRef}" "${toRef}"`
-        : `git diff --name-status "${fromRef}"`;
-      const raw = await exec(cmd, root);
-      return raw.split('\n').filter(Boolean).map(line => {
-        const parts = line.split('\t');
-        return { status: parts[0][0], path: parts[parts.length - 1] };
-      });
-    } catch { return []; }
+      const extra = toRef ? [fromRef, toRef] : [fromRef];
+      const changes = await nameStatusDiff(this.gitClient(base), ...extra);
+      const letter: Record<GitFileChange['status'], string> = {
+        added: 'A',
+        modified: 'M',
+        deleted: 'D',
+        renamed: 'R',
+      };
+      return changes.map(c => ({ status: letter[c.status], path: c.path }));
+    } catch {
+      return [];
+    }
   }
 
-  /**
-   * Get the normalized GitHub HTTPS URL for the origin remote.
-   * Handles HTTPS, git@, and ssh:// formats. Returns empty string if not GitHub.
-   */
   async getGitHubUrl(cwd?: string): Promise<string> {
-    const root = cwd || getWorkspaceRoot();
+    const root = cwd || this.workspaceRoot();
     if (!root) { return ''; }
     try {
-      const url = (await exec('git remote get-url origin', root)).trim();
+      const remotes = await this.gitClient(root).getRemotes(true);
+      const origin = remotes.find(r => r.name === 'origin');
+      const url = origin?.refs?.fetch || origin?.refs?.push || '';
+      if (!url) {
+        return '';
+      }
       return url
         .replace(/\.git$/, '')
         .replace(/^git@github\.com:/, 'https://github.com/')
         .replace(/^ssh:\/\/git@github\.com\//, 'https://github.com/');
-    } catch { return ''; }
+    } catch {
+      return '';
+    }
   }
 
-  /**
-   * owner/repo slug for the origin remote, or empty string if not GitHub.
-   * Used by {@link GitHubService} to scope Octokit API requests.
-   * @param cwd - Optional repo root (defaults to workspace root)
-   */
   async getOwnerRepo(cwd?: string): Promise<string> {
     const url = await this.getGitHubUrl(cwd);
     if (!url) { return ''; }
@@ -915,121 +855,135 @@ export class GitService {
     }
   }
 
-  /**
-   * Get commit log with custom format. Returns raw output string.
-   */
   async getLogRaw(format: string, limit: number, refArgs: string): Promise<string> {
-    const root = getWorkspaceRoot();
-    if (!root) { return ''; }
+    const base = await this.repoBase();
+    if (!base) { return ''; }
     try {
-      return await exec(`git log --date-order --format="${format}" -${limit}${refArgs}`, root);
-    } catch { return ''; }
+      const extra = refArgs.trim().split(/\s+/).filter(Boolean);
+      return await gitRaw(this.gitClient(base), [
+        'log',
+        '--date-order',
+        `--format=${format}`,
+        `-${limit}`,
+        ...extra,
+      ]);
+    } catch {
+      return '';
+    }
   }
 
-  /**
-   * Get shortstat log. Returns raw output string.
-   */
   async getLogShortstat(format: string, limit: number, refArgs: string): Promise<string> {
-    const root = getWorkspaceRoot();
-    if (!root) { return ''; }
+    const base = await this.repoBase();
+    if (!base) { return ''; }
     try {
-      return await exec(`git log --date-order --format="${format}" --shortstat -${limit}${refArgs}`, root);
-    } catch { return ''; }
+      const extra = refArgs.trim().split(/\s+/).filter(Boolean);
+      return await gitRaw(this.gitClient(base), [
+        'log',
+        '--date-order',
+        `--format=${format}`,
+        '--shortstat',
+        `-${limit}`,
+        ...extra,
+      ]);
+    } catch {
+      return '';
+    }
   }
 
-  /**
-   * Get outgoing commits (local commits not on upstream).
-   */
   async getOutgoingCommits(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git log --oneline @{u}..HEAD', root);
+      const raw = await gitRaw(this.gitClient(base), ['log', '--oneline', '@{u}..HEAD']);
       return raw.split('\n').filter(Boolean).map(l => l.split(' ')[0]);
-    } catch { return []; }
+    } catch {
+      return [];
+    }
   }
 
-  /**
-   * Get incoming commits (upstream commits not yet pulled).
-   */
   async getIncomingCommits(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git log --oneline HEAD..@{u}', root);
+      const raw = await gitRaw(this.gitClient(base), ['log', '--oneline', 'HEAD..@{u}']);
       return raw.split('\n').filter(Boolean).map(l => l.split(' ')[0]);
-    } catch { return []; }
+    } catch {
+      return [];
+    }
   }
 
   async getRecentMerges(limit = 5): Promise<Array<{ sha: string; message: string }>> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec(`git log --merges --oneline -${limit}`, root);
+      const raw = await gitRaw(this.gitClient(base), ['log', '--merges', '--oneline', `-${limit}`]);
       return raw.split('\n').filter(Boolean).map(line => {
         const sp = line.indexOf(' ');
         return { sha: line.substring(0, sp), message: line.substring(sp + 1) };
       });
-    } catch { return []; }
+    } catch {
+      return [];
+    }
   }
 
   async pullRebase(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git pull --rebase', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).pull(['--rebase']);
   }
 
   async pullFrom(remote: string, branch: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git pull "${remote}" "${branch}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).pull(remote, branch);
   }
 
   async pushTo(remote: string, branch: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec(`git push "${remote}" "${branch}"`, root);
+    const base = await this.repoBase();
+    await this.gitClient(base).push(remote, branch);
   }
 
   async listRemotes(): Promise<string[]> {
-    const root = getWorkspaceRoot();
-    if (!root) { return []; }
+    const base = await this.repoBase();
+    if (!base) { return []; }
     try {
-      const raw = await exec('git remote', root);
-      return raw ? raw.split('\n').filter(Boolean) : [];
+      const remotes = await this.gitClient(base).getRemotes();
+      return remotes.map(r => r.name);
     } catch {
       return [];
     }
   }
 
   async stash(message?: string): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    const msg = message ? ` -m "${message.replace(/"/g, '\\"')}"` : '';
-    await exec(`git stash push${msg}`, root);
+    const base = await this.repoBase();
+    const args = ['push'];
+    if (message) { args.push('-m', message); }
+    await this.gitClient(base).stash(args);
   }
 
   async stashPop(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git stash pop', root);
+    const base = await this.repoBase();
+    await this.gitClient(base).stash(['pop']);
   }
 
-  /** Pull then push */
   async sync(): Promise<void> {
-    const root = getWorkspaceRoot();
-    if (!root) { throw new Error('No workspace root'); }
-    await exec('git pull', root);
-    await exec('git push', root);
+    const base = await this.repoBase();
+    const git = this.gitClient(base);
+    await git.pull();
+    await git.push();
   }
 
-  /**
-   * Clone a GitHub repository into a parent directory.
-   * @param repoUrl - The repo URL (e.g. "https://github.com/owner/repo")
-   * @param parentDir - Directory that will contain the cloned repo folder
-   */
   async cloneRepo(repoUrl: string, parentDir: string): Promise<void> {
-    await exec(`git clone "${repoUrl}"`, parentDir);
+    await getGit(parentDir).clone(repoUrl);
+  }
+
+  /** Initial commit + push for a newly scaffolded project directory. */
+  async initialCommitAndPush(
+    projectDir: string,
+    message: string,
+    branch = 'main',
+    remote = 'origin',
+  ): Promise<void> {
+    await this.commitAll(message, projectDir);
+    await this.gitClient(projectDir).push(remote, branch, ['--set-upstream']);
   }
 
   getCachedBranch(): string {

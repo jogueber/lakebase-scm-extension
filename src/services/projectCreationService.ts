@@ -205,11 +205,11 @@ export class ProjectCreationService {
     const langLabels: Record<string, string> = { java: 'Java/Spring Boot', python: 'Python/FastAPI', nodejs: 'Node.js/Express' };
     const langLabel = langLabels[language] || language;
     report('Creating initial commit...');
-    await exec('git add -A', { cwd: projectDir });
-    await exec(`git commit -m "Initial project scaffold (${langLabel} + Lakebase)"`, { cwd: projectDir, timeout: 30000 });
-
     try {
-      await exec('git push -u origin main', { cwd: projectDir, timeout: 30000 });
+      await this.gitService.initialCommitAndPush(
+        projectDir,
+        `Initial project scaffold (${langLabel} + Lakebase)`,
+      );
     } catch (err: any) {
       const msg = (err.stderr || err.stdout || err.message || '').toString();
       if (/without `?workflow`? scope|workflow scope/i.test(msg)) {

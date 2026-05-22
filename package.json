@@ -1426,6 +1426,7 @@
     "find-java-home": "^2.0.0",
     "octokit": "^5.0.5",
     "pg": "^8.20.0",
+    "simple-git": "^3.36.0",
     "tar": "^7.5.15",
     "tree-kill": "^1.2.2",
     "tweetnacl": "^1.0.3",

@@ -2,11 +2,9 @@ import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
 import * as vscode from 'vscode';
 import { GitService } from '../../src/services/gitService';
+import { installMockGitFromExec } from '../helpers/mockGitClient';
 import { LakebaseService, LakebaseBranch } from '../../src/services/lakebaseService';
 import { SchemaDiffService } from '../../src/services/schemaDiffService';
-
-const cpModule = require('child_process');
-const originalExec = cpModule.exec;
 
 /**
  * Tests for Lakebase synchronization behavior across git operations.
@@ -203,31 +201,28 @@ describe('GitService — getFileAtRef and getMergeBase', () => {
     (vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: '/fake/root' } }];
   });
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
     sinon.restore();
   });
 
   describe('getFileAtRef', () => {
     it('returns file contents at a given ref', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('git show')) {
-          cb(null, 'public class App { }', '');
+          return { stdout: 'public class App { }' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const content = await service.getFileAtRef('abc123', 'src/App.java');
       assert.strictEqual(content, 'public class App { }');
     });
 
     it('returns empty string for file not at ref', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('path not found'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('path not found') };
+      });
       const service = new GitService();
       const content = await service.getFileAtRef('abc123', 'nonexistent.ts');
       assert.strictEqual(content, '');
@@ -237,45 +232,42 @@ describe('GitService — getFileAtRef and getMergeBase', () => {
   describe('getMergeBase', () => {
     it('returns merge-base commit sha', async () => {
       let callCount = 0;
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         callCount++;
         if (cmd.includes('rev-parse --verify main')) {
-          cb(null, '', '');
+          return { stdout: '' };
         } else if (cmd.includes('merge-base')) {
-          cb(null, 'abc123def', '');
+          return { stdout: 'abc123def' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const base = await service.getMergeBase();
       assert.strictEqual(base, 'abc123def');
     });
 
     it('falls back to master if main not found', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
+      installMockGitFromExec((cmd: string) => {
         if (cmd.includes('rev-parse --verify main')) {
-          cb(new Error('not found'), '', '');
+          return { error: new Error('not found') };
         } else if (cmd.includes('rev-parse --verify master')) {
-          cb(null, '', '');
+          return { stdout: '' };
         } else if (cmd.includes('merge-base')) {
-          cb(null, 'def456', '');
+          return { stdout: 'def456' };
         } else {
-          cb(null, '', '');
+          return { stdout: '' };
         }
-      };
+      });
       const service = new GitService();
       const base = await service.getMergeBase();
       assert.strictEqual(base, 'def456');
     });
 
     it('returns empty if neither main nor master exist', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        cb(new Error('not found'), '', '');
-      };
+      installMockGitFromExec((cmd: string) => {
+        return { error: new Error('not found') };
+      });
       const service = new GitService();
       const base = await service.getMergeBase();
       assert.strictEqual(base, '');
@@ -288,20 +280,20 @@ describe('GitService — deleteRemoteTag', () => {
     (vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: '/fake/root' } }];
   });
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
+    sinon.restore();
   });
 
   it('runs git push origin --delete refs/tags/', async () => {
     let cmd = '';
-    cpModule.exec = (c: string, _opts: any, cb: Function) => {
-      if (typeof _opts === 'function') { cb = _opts; }
+    installMockGitFromExec((c: string) => {
       cmd = c;
-      cb(null, '', '');
-    };
+      return { stdout: '' };
+    });
     const service = new GitService();
     await service.deleteRemoteTag('v1.0.0');
-    assert.ok(cmd.includes('git push origin --delete "refs/tags/v1.0.0"'));
+    assert.ok(cmd.includes('git push origin --delete'));
+    assert.ok(cmd.includes('refs/tags/v1.0.0'));
   });
 });
 

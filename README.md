@@ -74,8 +74,9 @@ Smart scripts (`flyway-migrate.sh`, `run-tests.sh`) auto-detect the language fro
 | Requirement | Install |
 |-------------|---------|
 | VS Code 1.85+ or Cursor | — |
+| Git | On your PATH (`git --version`); used via [simple-git](https://github.com/steveukx/git-js) for local branch/commit/sync |
 | Databricks CLI v0.285+ | `brew install databricks` |
-| GitHub sign-in (VS Code) or PAT | Sign in when prompted, or set `lakebaseSync.githubToken` |
+| GitHub sign-in (VS Code) or PAT | Sign in when prompted, or set `lakebaseSync.githubToken` (replaces GitHub CLI for PRs/secrets) |
 | PostgreSQL client (psql) | `brew install libpq` |
 | Databricks workspace | With Lakebase enabled |
 

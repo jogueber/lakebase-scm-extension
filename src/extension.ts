@@ -2748,23 +2748,17 @@ export async function activate(context: vscode.ExtensionContext) {
         const cfgPr = getConfig();
         let prBase: string | undefined;
         try {
-          const { exec: execUtil } = require('./utils/exec');
-          const root = getWorkspaceRoot();
           const trunk = cfgPr.trunkBranch || 'main';
           const staging = cfgPr.stagingBranch || 'staging';
           const rawCandidates = Array.from(new Set([trunk, 'master', staging, cfgPr.baseBranch].filter(Boolean) as string[]));
           const locals = new Set((await gitService.listLocalBranches()).map(b => b.name));
           const existing = rawCandidates.filter(c => locals.has(c) && c !== currentBranch);
           const ranked: Array<{ branch: string; ts: number }> = [];
-          if (root) {
-            for (const c of existing) {
-              try {
-                const base = (await execUtil(`git merge-base HEAD "${c}"`, root)).trim();
-                if (base) {
-                  const ts = parseInt((await execUtil(`git log -1 --format=%at "${base}"`, root)).trim(), 10) || 0;
-                  ranked.push({ branch: c, ts });
-                }
-              } catch { /* ignore */ }
+          for (const c of existing) {
+            const base = await gitService.mergeBase('HEAD', c);
+            if (base) {
+              const ts = await gitService.commitTimestamp(base);
+              ranked.push({ branch: c, ts });
             }
           }
           ranked.sort((a, b) => b.ts - a.ts);
@@ -2789,14 +2783,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
         // Step 2: Check if branch has any commits vs the selected base
         try {
-          const root = getWorkspaceRoot();
-          if (root) {
-            const { exec: execUtil } = require('./utils/exec');
-            const count = (await execUtil(`git rev-list --count ${prBase}..HEAD`, root)).trim();
-            if (parseInt(count, 10) === 0) {
-              vscode.window.showWarningMessage(`No commits between ${prBase} and this branch. Nothing to create a PR for.`);
-              return;
-            }
+          const count = await gitService.revListCount(`${prBase}..HEAD`);
+          if (count === 0) {
+            vscode.window.showWarningMessage(`No commits between ${prBase} and this branch. Nothing to create a PR for.`);
+            return;
           }
         } catch { /* ignore — branch may not have diverged from base yet */ }
 

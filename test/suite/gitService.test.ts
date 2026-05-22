@@ -1,42 +1,42 @@
 import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
-import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { GitService } from '../../src/services/gitService';
-
-// cp.exec is non-configurable in newer Node, so we intercept via the module's internal reference
-const cpModule = require('child_process');
-const originalExec = cpModule.exec;
+import * as gitClient from '../../src/utils/gitClient';
 
 describe('GitService', () => {
   let service: GitService;
+  let gitRawStub: sinon.SinonStub;
+  let revparseStub: sinon.SinonStub;
+  let nameStatusDiffStub: sinon.SinonStub;
+  let nameOnlyDiffStub: sinon.SinonStub;
+  let existsRefStub: sinon.SinonStub;
+  let getGitStub: sinon.SinonStub;
 
   beforeEach(() => {
     service = new GitService();
     (vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: '/fake/root' } }];
+    getGitStub = sinon.stub(gitClient, 'getGit').returns({} as ReturnType<typeof gitClient.getGit>);
+    gitRawStub = sinon.stub(gitClient, 'gitRaw');
+    revparseStub = sinon.stub(gitClient, 'revparse');
+    nameStatusDiffStub = sinon.stub(gitClient, 'nameStatusDiff');
+    nameOnlyDiffStub = sinon.stub(gitClient, 'nameOnlyDiff');
+    existsRefStub = sinon.stub(gitClient, 'existsRef');
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     sinon.restore();
   });
 
-  function mockExec(stdout: string) {
-    cpModule.exec = (_cmd: string, _opts: any, cb: Function) => {
-      if (typeof _opts === 'function') { cb = _opts; }
-      cb(null, stdout, '');
-    };
-  }
-
   describe('getCurrentBranch', () => {
     it('returns the current branch name', async () => {
-      mockExec('feature/dev-sprint-1\n');
+      revparseStub.resolves('feature/dev-sprint-1');
       const branch = await service.getCurrentBranch();
       assert.strictEqual(branch, 'feature/dev-sprint-1');
     });
 
     it('trims whitespace', async () => {
-      mockExec('  main  \n');
+      revparseStub.resolves('  main  ');
       const branch = await service.getCurrentBranch();
       assert.strictEqual(branch, 'main');
     });
@@ -44,22 +44,14 @@ describe('GitService', () => {
 
   describe('listLocalBranches', () => {
     it('parses branch output with tracking info', async () => {
-      // listLocalBranches calls getCurrentBranch first, then git branch --format
-      let callCount = 0;
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        callCount++;
-        if (cmd.includes('rev-parse') || callCount === 1) {
-          cb(null, 'main', '');
-        } else {
-          // --format="%(refname:short)|%(upstream:short)|%(upstream:track)"
-          cb(null, [
-            'main|origin/main|',
-            'feature-x|origin/feature-x|[ahead 2, behind 1]',
-            'orphan||',
-          ].join('\n'), '');
-        }
-      };
+      revparseStub.resolves('main');
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        return [
+          'main|origin/main|',
+          'feature-x|origin/feature-x|[ahead 2, behind 1]',
+          'orphan||',
+        ].join('\n');
+      });
 
       const branches = await service.listLocalBranches();
       assert.strictEqual(branches.length, 3);
@@ -78,16 +70,25 @@ describe('GitService', () => {
 
   describe('getChangedFiles', () => {
     it('parses diff output into file changes', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('merge-base')) {
-          cb(null, 'abc123', '');
-        } else if (cmd.includes('ls-files')) {
-          cb(null, '', '');
-        } else {
-          cb(null, 'A\tsrc/new-file.ts\nM\tsrc/changed.ts\nD\tsrc/removed.ts\n', '');
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        if (args[0] === 'merge-base') {
+          return 'abc123';
         }
-      };
+        if (args.includes('ls-files')) {
+          return '';
+        }
+        if (args[0] === 'log') {
+          return '1000';
+        }
+        return '';
+      });
+      existsRefStub.resolves(true);
+      revparseStub.resolves('main');
+      nameStatusDiffStub.resolves([
+        { status: 'added', path: 'src/new-file.ts' },
+        { status: 'modified', path: 'src/changed.ts' },
+        { status: 'deleted', path: 'src/removed.ts' },
+      ]);
 
       const files = await service.getChangedFiles();
       assert.strictEqual(files.length, 3);
@@ -104,16 +105,17 @@ describe('GitService', () => {
     });
 
     it('handles renamed files', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('merge-base')) {
-          cb(null, 'abc123', '');
-        } else if (cmd.includes('ls-files')) {
-          cb(null, '', '');
-        } else {
-          cb(null, 'R100\told-name.ts\tnew-name.ts\n', '');
-        }
-      };
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        if (args[0] === 'merge-base') { return 'abc123'; }
+        if (args.includes('ls-files')) { return ''; }
+        if (args[0] === 'log') { return '1000'; }
+        return '';
+      });
+      existsRefStub.resolves(true);
+      revparseStub.resolves('feature');
+      nameStatusDiffStub.resolves([
+        { status: 'renamed', path: 'new-name.ts', oldPath: 'old-name.ts' },
+      ]);
 
       const files = await service.getChangedFiles();
       assert.strictEqual(files.length, 1);
@@ -123,18 +125,17 @@ describe('GitService', () => {
     });
 
     it('includes untracked files as added', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('merge-base')) {
-          cb(null, 'abc123', '');
-        } else if (cmd.includes('ls-files')) {
-          cb(null, 'src/untracked-new.ts\nsrc/another-new.ts\n', '');
-        } else if (cmd.includes('diff')) {
-          cb(null, 'M\tsrc/existing.ts\n', '');
-        } else {
-          cb(null, '', '');
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        if (args[0] === 'merge-base') { return 'abc123'; }
+        if (args.includes('ls-files')) {
+          return 'src/untracked-new.ts\nsrc/another-new.ts';
         }
-      };
+        if (args[0] === 'log') { return '1000'; }
+        return '';
+      });
+      existsRefStub.resolves(true);
+      revparseStub.resolves('feature');
+      nameStatusDiffStub.resolves([{ status: 'modified', path: 'src/existing.ts' }]);
 
       const files = await service.getChangedFiles();
       assert.strictEqual(files.length, 3);
@@ -145,33 +146,34 @@ describe('GitService', () => {
     });
 
     it('does not duplicate files already in diff', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('merge-base')) {
-          cb(null, 'abc123', '');
-        } else if (cmd.includes('ls-files')) {
-          cb(null, 'src/new-file.ts\n', ''); // same as diff output
-        } else if (cmd.includes('diff')) {
-          cb(null, 'A\tsrc/new-file.ts\n', '');
-        } else {
-          cb(null, '', '');
-        }
-      };
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        if (args[0] === 'merge-base') { return 'abc123'; }
+        if (args.includes('ls-files')) { return 'src/new-file.ts'; }
+        if (args[0] === 'log') { return '1000'; }
+        return '';
+      });
+      existsRefStub.resolves(true);
+      revparseStub.resolves('feature');
+      nameStatusDiffStub.resolves([{ status: 'added', path: 'src/new-file.ts' }]);
 
       const files = await service.getChangedFiles();
-      assert.strictEqual(files.length, 1); // no duplicate
+      assert.strictEqual(files.length, 1);
     });
   });
 
   describe('getStagedFiles', () => {
     it('returns list of staged file paths', async () => {
-      mockExec('src/file1.ts\nsrc/file2.ts\n');
+      gitRawStub.onFirstCall().resolves('/fake/root');
+      nameOnlyDiffStub.resolves(['src/file1.ts', 'src/file2.ts']);
+
       const staged = await service.getStagedFiles();
       assert.deepStrictEqual(staged, ['src/file1.ts', 'src/file2.ts']);
     });
 
     it('returns empty array when nothing staged', async () => {
-      mockExec('');
+      gitRawStub.onFirstCall().resolves('/fake/root');
+      nameOnlyDiffStub.resolves([]);
+
       const staged = await service.getStagedFiles();
       assert.deepStrictEqual(staged, []);
     });
@@ -185,9 +187,28 @@ describe('GitService', () => {
 
   describe('listMigrationsOnBranch', () => {
     it('lists V*.sql files from git ls-tree', async () => {
-      mockExec('V1__init.sql\nV2__create_table.sql\nREADME.md\n');
+      revparseStub.resolves('/fake/root');
+      gitRawStub.callsFake(async (_git, args: string[]) => {
+        if (args[0] === 'ls-tree') {
+          return 'V1__init.sql\nV2__create_table.sql\nREADME.md';
+        }
+        return '';
+      });
+
       const migs = await service.listMigrationsOnBranch('main', 'src/main/resources/db/migration');
       assert.deepStrictEqual(migs, ['V1__init.sql', 'V2__create_table.sql']);
+    });
+  });
+
+  describe('parseNameStatus (gitClient)', () => {
+    it('parses added, modified, deleted, and renamed lines', () => {
+      const changes = gitClient.parseNameStatus(
+        'A\tnew.ts\nM\tmod.ts\nD\tdel.ts\nR100\told.ts\trenamed.ts',
+      );
+      assert.strictEqual(changes.length, 4);
+      assert.strictEqual(changes[3].status, 'renamed');
+      assert.strictEqual(changes[3].path, 'renamed.ts');
+      assert.strictEqual(changes[3].oldPath, 'old.ts');
     });
   });
 });

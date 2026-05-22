@@ -2,9 +2,7 @@ import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
 import * as vscode from 'vscode';
 import { GitService } from '../../src/services/gitService';
-
-const cpModule = require('child_process');
-const originalExec = cpModule.exec;
+import { installMockGitFromExec } from '../helpers/mockGitClient';
 
 describe('GitService — extended operations', () => {
   beforeEach(() => {
@@ -12,18 +10,12 @@ describe('GitService — extended operations', () => {
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
     sinon.restore();
   });
 
   function mockExecCmd(handler: (cmd: string) => { stdout?: string; error?: Error }) {
-    cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-      if (typeof _opts === 'function') { cb = _opts; }
-      const result = handler(cmd);
-      if (result.error) { cb(result.error, '', result.error.message); }
-      else { cb(null, result.stdout || '', ''); }
-    };
+    installMockGitFromExec(handler);
   }
 
   // --- Commit variants ---
@@ -127,7 +119,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.rebaseBranch('main');
-      assert.ok(cmd.includes('git rebase "main"'));
+      assert.ok(cmd.includes('git rebase') && cmd.includes('main'));
     });
   });
 
@@ -139,7 +131,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.deleteBranch('old-branch');
-      assert.ok(cmd.includes('git branch -d "old-branch"'));
+      assert.ok(cmd.includes('git branch -d') && cmd.includes('old-branch'));
     });
   });
 
@@ -149,7 +141,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.deleteRemoteBranch('old-branch');
-      assert.ok(cmd.includes('git push origin --delete "old-branch"'));
+      assert.ok(cmd.includes('git push origin --delete') && cmd.includes('old-branch'));
     });
   });
 
@@ -159,7 +151,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.renameBranch('new-name');
-      assert.ok(cmd.includes('git branch -m "new-name"'));
+      assert.ok(cmd.includes('git branch -m') && cmd.includes('new-name'));
     });
   });
 
@@ -169,7 +161,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.mergeBranch('feature-x');
-      assert.ok(cmd.includes('git merge "feature-x"'));
+      assert.ok(cmd.includes('git merge') && cmd.includes('feature-x'));
     });
   });
 
@@ -181,7 +173,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.addRemote('upstream', 'https://github.com/org/repo.git');
-      assert.ok(cmd.includes('git remote add "upstream" "https://github.com/org/repo.git"'));
+      assert.ok(cmd.includes('git remote add') && cmd.includes('upstream') && cmd.includes('github.com'));
     });
   });
 
@@ -191,7 +183,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.removeRemote('upstream');
-      assert.ok(cmd.includes('git remote remove "upstream"'));
+      assert.ok(cmd.includes('git remote remove') && cmd.includes('upstream'));
     });
   });
 
@@ -231,7 +223,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.pullFrom('upstream', 'main');
-      assert.ok(cmd.includes('git pull "upstream" "main"'));
+      assert.ok(cmd.includes('git pull') && cmd.includes('upstream') && cmd.includes('main'));
     });
   });
 
@@ -241,7 +233,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.pushTo('upstream', 'main');
-      assert.ok(cmd.includes('git push "upstream" "main"'));
+      assert.ok(cmd.includes('git push') && cmd.includes('upstream') && cmd.includes('main'));
     });
   });
 
@@ -383,7 +375,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.deleteTag('v1.0.0');
-      assert.ok(cmd.includes('git tag -d "v1.0.0"'));
+      assert.ok(cmd.includes('git tag -d') && cmd.includes('v1.0.0'));
     });
   });
 
@@ -393,7 +385,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.deleteRemoteTag('v1.0.0');
-      assert.ok(cmd.includes('git push origin --delete "refs/tags/v1.0.0"'));
+      assert.ok(cmd.includes('git push origin --delete') && cmd.includes('refs/tags/v1.0.0'));
     });
   });
 
@@ -420,7 +412,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.createWorktree('/tmp/wt', 'feature-wt');
-      assert.ok(cmd.includes('git worktree add "/tmp/wt" -b "feature-wt"'));
+      assert.ok(cmd.includes('git worktree add') && cmd.includes('/tmp/wt') && cmd.includes('feature-wt'));
     });
   });
 
@@ -447,7 +439,7 @@ describe('GitService — extended operations', () => {
       mockExecCmd(c => { cmd = c; return {}; });
       const service = new GitService();
       await service.removeWorktree('/tmp/wt');
-      assert.ok(cmd.includes('git worktree remove "/tmp/wt"'));
+      assert.ok(cmd.includes('git worktree remove') && cmd.includes('/tmp/wt'));
     });
   });
 

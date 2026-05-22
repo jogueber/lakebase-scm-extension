@@ -7,9 +7,7 @@ import { SchemaMigrationService } from '../../src/services/schemaMigrationServic
 import { SchemaDiffService, SchemaDiffResult } from '../../src/services/schemaDiffService';
 import { LakebaseService, LakebaseBranch } from '../../src/services/lakebaseService';
 import { GitHubService } from '../../src/services/githubService';
-
-const cpModule = require('child_process');
-const originalExec = cpModule.exec;
+import { installMockGitFromExec } from '../helpers/mockGitClient';
 
 describe('Merge Awareness — main branch view', () => {
   let provider: SchemaScmProvider;
@@ -48,7 +46,6 @@ describe('Merge Awareness — main branch view', () => {
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     if (provider) { provider.dispose(); }
     sinon.restore();
   });
@@ -123,20 +120,11 @@ describe('Merge Awareness — main branch view', () => {
 
   describe('Recent Merges group', () => {
     it('shows recent merge commits on main', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('git log --merges')) {
-          cb(null, 'abc1234 Merge pull request #9 from feature/orders\ndef5678 Merge pull request #8 from feature/cart\n', '');
-        } else if (cmd.includes('git remote get-url')) {
-          cb(null, 'https://github.com/user/repo.git', '');
-        } else if (cmd.includes('rev-parse --abbrev-ref HEAD')) {
-          cb(null, 'main', '');
-        } else if (cmd.includes('rev-parse --verify')) {
-          cb(null, '', '');
-        } else {
-          cb(null, '', '');
-        }
-      };
+      gitStub.getRecentMerges.resolves([
+        { sha: 'abc1234', message: 'Merge pull request #9 from feature/orders' },
+        { sha: 'def5678', message: 'Merge pull request #8 from feature/cart' },
+      ]);
+      gitStub.getGitHubUrl.resolves('https://github.com/user/repo');
 
       migrationStub.listMigrations.returns([]);
       lakebaseStub.getDefaultBranch.resolves(makeBranch('prod', 'READY', true));
@@ -165,14 +153,7 @@ describe('Merge Awareness — main branch view', () => {
     });
 
     it('shows empty when no merge commits', async () => {
-      cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-        if (typeof _opts === 'function') { cb = _opts; }
-        if (cmd.includes('git log --merges')) {
-          cb(null, '', '');
-        } else {
-          cb(null, '', '');
-        }
-      };
+      gitStub.getRecentMerges.resolves([]);
 
       migrationStub.listMigrations.returns([]);
       lakebaseStub.getDefaultBranch.resolves(makeBranch('prod', 'READY', true));
@@ -302,21 +283,20 @@ describe('GitService — getAheadBehind', () => {
   });
 
   afterEach(() => {
-    cpModule.exec = originalExec;
     (vscode.workspace as any).workspaceFolders = undefined;
+    sinon.restore();
   });
 
   it('returns ahead and behind counts', async () => {
-    cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-      if (typeof _opts === 'function') { cb = _opts; }
+    installMockGitFromExec((cmd: string) => {
       if (cmd.includes('rev-parse --abbrev-ref @{u}')) {
-        cb(null, 'origin/feature-x', '');
-      } else if (cmd.includes('rev-list')) {
-        cb(null, '3\t2', '');
-      } else {
-        cb(null, '', '');
+        return { stdout: 'origin/feature-x' };
       }
-    };
+      if (cmd.includes('rev-list')) {
+        return { stdout: '3\t2' };
+      }
+      return {};
+    });
     const service = new GitService();
     const result = await service.getAheadBehind();
     assert.strictEqual(result.ahead, 3);
@@ -325,10 +305,7 @@ describe('GitService — getAheadBehind', () => {
   });
 
   it('returns zeros when no upstream', async () => {
-    cpModule.exec = (cmd: string, _opts: any, cb: Function) => {
-      if (typeof _opts === 'function') { cb = _opts; }
-      cb(new Error('no upstream'), '', '');
-    };
+    installMockGitFromExec(() => ({ error: new Error('no upstream') }));
     const service = new GitService();
     const result = await service.getAheadBehind();
     assert.strictEqual(result.ahead, 0);

@@ -1387,6 +1387,11 @@
           "type": "string",
           "default": "",
           "description": "String prefix that scopes the branch-tree view to this project's git branches. Only branches whose name starts with this prefix are listed (the current branch is always shown regardless). Useful in monorepos with branches from other projects/users. Overrides LAKEBASE_GIT_BRANCH_PREFIX from .env if both are set."
+        },
+        "lakebaseSync.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional GitHub PAT for headless/CI use. Leave empty to use VS Code GitHub sign-in."
         }
       }
     }
@@ -1417,7 +1422,14 @@
     "webpack-cli": "^5.1.0"
   },
   "dependencies": {
+    "command-exists": "^1.2.9",
+    "find-java-home": "^2.0.0",
+    "octokit": "^5.0.5",
     "pg": "^8.20.0",
+    "tar": "^7.5.15",
+    "tree-kill": "^1.2.2",
+    "tweetnacl": "^1.0.3",
+    "tweetsodium": "^0.0.4",
     "vsce": "^2.15.0"
   }
 }
